@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meshu hello</title>
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1.5rem;
+         background: #fff; color: #111; max-width: 30rem; margin-inline: auto; }
+  h1 { font-size: 1.4rem; }
+  button { font-size: 1.1rem; padding: .8rem 1.4rem; width: 100%;
+           border: 2px solid #111; background: #fff; border-radius: 10px; }
+  button:disabled { opacity: .4; }
+  #status { margin: 1rem 0; font-weight: 600; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: .8rem 1rem;
+          margin: .6rem 0; word-break: break-all; font-size: .85rem; }
+  .card b { display: inline-block; min-width: 6rem; }
+  #log { background: #f6f6f6; border-radius: 10px; padding: .8rem;
+         font-family: ui-monospace, monospace; font-size: .72rem; height: 14rem;
+         overflow-y: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>meshu — hello node</h1>
+<p>Connects to the MeshCore companion node over BLE, sends APP_START,
+shows SELF_INFO. No wallet, no mesh, just the pipe.</p>
+
+<button id="connect">Connect to node</button>
+<div id="status">idle</div>
+
+<div id="info" hidden>
+  <div class="card"><b>node</b> <span id="nodeName"></span></div>
+  <div class="card"><b>pubkey</b> <span id="nodeKey"></span></div>
+  <div class="card"><b>radio</b> <span id="nodeRadio"></span></div>
+  <div class="card"><b>tx power</b> <span id="nodeTx"></span></div>
+</div>
+
+<div id="log"></div>
+
+<script>
+'use strict';
+
+// MeshCore companion over BLE GATT (Nordic UART service).
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX_CHAR     = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // app -> node
+const TX_CHAR     = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // node -> app
+
+// APP_START: [0x01, 0x03 (protocol version!), 6 spaces, app name]
+// (byte 1 MUST be 0x03 — the "reserved" docs lie; the firmware requires it)
+const APP_START = [0x01, 0x03, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
+  .concat(Array.from(new TextEncoder().encode('meshu-hw')));
+
+const $ = id => document.getElementById(id);
+const log = msg => {
+  const t = new Date().toISOString().slice(11, 23);
+  $('log').textContent += `[${t}] ${msg}\n`;
+  $('log').scrollTop = 1e9;
+};
+const status = s => { $('status').textContent = s; log(s); };
+
+let device = null, rxChar = null;
+
+// Notifications may arrive in chunks; accumulate and parse SELF_INFO once
+// we hold a full frame (>=58 bytes starting with 0x05).
+let buf = new Uint8Array(0);
+
+function appendBuf(chunk) {
+  const next = new Uint8Array(buf.length + chunk.length);
+  next.set(buf); next.set(chunk, buf.length);
+  buf = next;
+}
+
+function parseSelfInfo() {
+  if (buf.length < 58 || buf[0] !== 0x05) return false;
+  const dv = new DataView(buf.buffer);
+  const key = Array.from(buf.slice(4, 36))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const freq = dv.getUint32(48, true) / 1000;
+  const bw   = dv.getUint32(52, true) / 1000;
+  const sf   = buf[56], cr = buf[57];
+  const name = new TextDecoder().decode(buf.slice(58)).replace(/\0/g, '').trim();
+
+  $('nodeName').textContent = name || '(unnamed)';
+  $('nodeKey').textContent  = key;
+  $('nodeRadio').textContent = `${freq} MHz / BW ${bw} kHz / SF${sf} / CR4/${cr + 4}`;
+  $('nodeTx').textContent    = `${buf[2]} (max ${buf[3]})`;
+  $('info').hidden = false;
+  status(`got SELF_INFO from "${name}"`);
+  buf = new Uint8Array(0);
+  return true;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    status('Web Bluetooth unavailable — need a SECURE context (see notes) and Android Chrome');
+    return;
+  }
+  try {
+    status('requesting device…');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [NUS_SERVICE] }]
+    });
+    device.addEventListener('gattserverdisconnected',
+      () => status('disconnected'));
+
+    status(`connecting to ${device.name}…`);
+    const server = await device.gatt.connect();
+    const svc  = await server.getPrimaryService(NUS_SERVICE);
+    rxChar = await svc.getCharacteristic(RX_CHAR);
+    const txChar = await svc.getCharacteristic(TX_CHAR);
+
+    await txChar.startNotifications();
+    txChar.addEventListener('characteristicvaluechanged', ev => {
+      appendBuf(new Uint8Array(ev.target.value.buffer));
+      parseSelfInfo();
+    });
+
+    status('connected — sending APP_START…');
+    await rxChar.writeValueWithResponse(new Uint8Array(APP_START));
+    status('APP_START sent, waiting for SELF_INFO…');
+  } catch (e) {
+    status(`error: ${e.message}`);
+  }
+}
+
+$('connect').addEventListener('click', connect);
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>
