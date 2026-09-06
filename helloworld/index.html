@@ -67,7 +67,7 @@ const APP_START = [0x01, 0x03, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
   .concat(Array.from(new TextEncoder().encode('meshu-hw')));
 
 // Companion frame types we care about.
-const T_SELF_INFO = 0x05, T_OK = 0x00, T_ERR = 0x01, T_RAW_PUSH = 0x84;
+const T_SELF_INFO = 0x05, T_OK = 0x00, T_ERR = 0x01, T_RAW_PUSH = 0x84, T_LOG_RX = 0x88;
 // Raw datagram send: CMD_SEND_RAW_DATA, zero-hop (PROTOCOL.md §2.4).
 const CMD_SEND_RAW = 0x19;
 // L1 kinds (§3.1): DATA 0x10, ACKBM 0x12, NACK 0x13, ABORT 0x14, PING 0x15.
@@ -125,16 +125,31 @@ function parseSelfInfo() {
 
 function parseRawPush() {
   // §2.5: [0x84][SNR s8 ×4][RSSI s8][0xFF][ dst ][ src ][ L1 frame ]
-  if (buf.length < 4 + 2 + 4) return false;
+  if (buf.length < 4 + 2 + 4) return false;   // wait for more bytes
   const snr  = signed8(buf[1]) / 4;
   const rssi = signed8(buf[2]);
   const dst = buf[4], src = buf[5];
-  const kind = buf[6] & 0x3F, flags = buf[7];
-  const msgId = (buf[8] << 8) | buf[9];
+  const kind = buf[6] & 0x3F;
+
+  if (kind !== K_PING) {
+    // Non-PING L1 frames have no self-describing length over BLE (no length
+    // prefix) — helloworld only pings, so drop the rest rather than desync.
+    log(`push: kind 0x${hex(kind)} (not PING) — unsupported here, ignored`);
+    buf = new Uint8Array(0);
+    return true;
+  }
+  // A PING L1 frame is exactly 4 bytes → this push frame is exactly 10.
+  // Consume EXACTLY 10 so a frame concatenated behind it in the same BLE
+  // notification (typically its 0x88 RF-log sibling) survives.
+  const frame = buf.slice(0, 10);
+  buf = buf.slice(10);
+  const msgId = (frame[8] << 8) | frame[9];
 
   if (dst !== ownHash) {
     log(`push for hash 0x${hex(dst)} (not us) — ignored`);
-  } else if (kind === K_PING && pongWaiter && msgId === pongWaiter.msgId) {
+    return true;
+  }
+  if (pongWaiter && msgId === pongWaiter.msgId) {
     const rtt = Date.now() - pongWaiter.sentAt;
     const w = pongWaiter;
     pongWaiter = null;
@@ -142,37 +157,73 @@ function parseRawPush() {
       `<b>pong</b> rtt=${rtt} ms · from 0x${hex(src)} · SNR ${snr.toFixed(1)} dB · RSSI ${rssi} dBm`;
     status(`pong from gateway 0x${hex(src)} in ${rtt} ms (SNR ${snr.toFixed(1)} dB, RSSI ${rssi} dBm)`);
     w.resolve({ rtt, snr, rssi, src });
-  } else if (kind === K_PING) {
-    log(`ping frame msg_id=0x${hex(msgId, 4)} but no ping in flight — ignored`);
   } else {
-    log(`push: kind 0x${hex(kind)} msg_id 0x${hex(msgId, 4)} — not a pong, ignored`);
+    log(`ping frame msg_id=0x${hex(msgId, 4)} but no ping in flight — ignored`);
   }
-  buf = new Uint8Array(0);
   return true;
 }
 
-function handleFrame() {
-  if (buf.length === 0) return;
-  switch (buf[0]) {
-    case T_SELF_INFO: parseSelfInfo(); break;
-    case T_RAW_PUSH:  if (!parseRawPush()) return; /* wait for more */ break;
-    case T_OK:
-      log('node: OK — datagram queued for the air');
-      buf = new Uint8Array(0);
-      break;
-    case T_ERR: {
-      const err = buf.length > 1 ? buf[1] : -1;
-      if (err === 3) {
-        log('node: queue FULL (§2.8) — the node is backed up, datagram was refused');
-      } else {
-        log(`node: ERR code ${err}`);
-      }
-      buf = new Uint8Array(0);
-      break;
+// 0x88 RF log: [0x88][SNR s8 ×4][RSSI s8][ raw air packet ] — the node pushes
+// one for EVERY packet its radio hears, BEFORE delivery. Decoding it shows what
+// actually reaches the node (and it frequently shares a BLE notification with
+// the 0x84 that follows it — so consume exactly, never blanket-clear).
+function parseLogRx() {
+  if (buf.length < 3) return false;            // wait for more bytes
+  const snr  = signed8(buf[1]) / 4;
+  const rssi = signed8(buf[2]);
+  let i = 3;                                    // start of raw air packet
+  if (buf.length < i + 2) return false;
+  const hdr = buf[i++];
+  if ((hdr >> 6) !== 0) i += 4;                 // transport codes (version != 0)
+  if (buf.length < i + 1) return false;
+  const pathLen = buf[i++];                     // encoded: count | mode<<6
+  const pathBytes = (pathLen & 63) * ((pathLen >> 6) + 1);
+  if (buf.length < i + pathBytes + 1) return false;
+  i += pathBytes;
+  const payloadLen = buf[i++];
+  if (buf.length < i + payloadLen) return false;
+  const total = i + payloadLen;
+  const type = (hdr >> 2) & 0xF;
+  const airHex = Array.from(buf.slice(2, total)).map(b => hex(b)).join('');
+  log(`RF rx: type=0x${hex(type)} snr=${snr.toFixed(1)}dB rssi=${rssi}dBm [${airHex}]`);
+  buf = buf.slice(total);
+  return true;
+}
+
+// One BLE notification may carry MULTIPLE concatenated companion frames (the
+// node pushes its 0x88 RF-log immediately before the 0x84 raw-data push for the
+// same packet). Consume frames one at a time by exact length; never clear the
+// buffer blindly — that would destroy whatever follows the frame in hand.
+function handleFrames() {
+  let guard = 0;
+  while (buf.length > 0 && guard++ < 32) {
+    switch (buf[0]) {
+      case T_SELF_INFO:
+        if (!parseSelfInfo()) return;          // incomplete — wait
+        break;
+      case T_RAW_PUSH:
+        if (!parseRawPush()) return;           // incomplete — wait
+        break;
+      case T_LOG_RX:
+        if (!parseLogRx()) return;             // incomplete — wait
+        break;
+      case T_OK:
+        log('node: OK — datagram queued for the air');
+        buf = buf.slice(1);                    // RESP_CODE_OK is exactly 1 byte
+        break;
+      case T_ERR:
+        if (buf.length < 2) return;             // incomplete — wait
+        if (buf[1] === 3) {
+          log('node: queue FULL (§2.8) — the node is backed up, datagram was refused');
+        } else {
+          log(`node: ERR code ${buf[1]}`);
+        }
+        buf = buf.slice(2);
+        break;
+      default:
+        log(`frame type 0x${hex(buf[0])} — unknown, dropped (buffer reset)`);
+        buf = new Uint8Array(0);
     }
-    default:
-      log(`frame type 0x${hex(buf[0])} — ignored`);
-      buf = new Uint8Array(0);
   }
 }
 
@@ -203,7 +254,7 @@ async function pingGateway() {
     // Raw datagrams have NO radio-layer retransmission — a lost ping is lost.
     // So retry up to 3 times, bumping the L1 ATTEMPT counter (§2.8/§3.1) so no
     // resend is byte-identical (MeshCore duplicate suppression would eat it).
-    const ATTEMPTS = 3, WAIT_MS = 10000;
+    const ATTEMPTS = 3, WAIT_MS = 20000;
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
       const flags = attempt << 2;                       // ATTEMPT bits 2–3
       // [0x19][path_len=0][ dst ][ src ][ 0x15 ][flags][ msgId BE ] (§2.4)
@@ -237,7 +288,7 @@ async function pingGateway() {
       log(`try ${attempt + 1}: no pong within ${WAIT_MS / 1000}s`);
       if (attempt < ATTEMPTS - 1) {
         log('retrying with ATTEMPT+1 (never a byte-identical resend, §2.8)');
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 5000));
       }
     }
     $('pingResult').textContent =
@@ -273,7 +324,7 @@ async function connect() {
     await txChar.startNotifications();
     txChar.addEventListener('characteristicvaluechanged', ev => {
       appendBuf(new Uint8Array(ev.target.value.buffer));
-      handleFrame();
+      handleFrames();
     });
 
     status('connected — sending APP_START…');
