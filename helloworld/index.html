@@ -178,7 +178,8 @@ function handleFrame() {
 // ---- gateway ping ---------------------------------------------------------
 
 function parseGatewayHash() {
-  const raw = $('gwInput').value.replace(/[\s:.-]/g, '').toLowerCase();
+  let raw = $('gwInput').value.replace(/[\s:.-]/g, '').toLowerCase();
+  if (raw.startsWith('0x')) raw = raw.slice(2);   // accept the "0xeb" form the gateway prints
   if (!/^[0-9a-f]+$/.test(raw)) return null;
   if (raw.length === 2) return parseInt(raw, 16);
   if (raw.length === 64) return parseInt(raw.slice(0, 2), 16); // pubkey[0] (§2.2)
