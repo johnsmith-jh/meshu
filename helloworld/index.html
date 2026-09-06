@@ -163,8 +163,7 @@ function handleFrame() {
     case T_ERR: {
       const err = buf.length > 1 ? buf[1] : -1;
       if (err === 3) {
-        log('node: queue FULL (§2.8) — wait a moment and tap again');
-        if (pendingPing) { pendingPing = null; $('ping').disabled = false; }
+        log('node: queue FULL (§2.8) — the node is backed up, datagram was refused');
       } else {
         log(`node: ERR code ${err}`);
       }
