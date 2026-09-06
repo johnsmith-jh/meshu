@@ -86,7 +86,8 @@ const signed8 = b => (b > 127 ? b - 256 : b);
 let device = null, rxChar = null;
 let ownHash = -1;                 // first byte of our node's pubkey (§2.2)
 let pingMsgId = 0;
-let pendingPing = null;           // { msgId, sentAt }
+let pongWaiter = null;            // resolves when the matching pong arrives
+let busy = false;                 // one ping sequence at a time
 
 // Notifications may arrive in chunks; accumulate, then dispatch by frame type.
 let buf = new Uint8Array(0);
@@ -133,15 +134,16 @@ function parseRawPush() {
 
   if (dst !== ownHash) {
     log(`push for hash 0x${hex(dst)} (not us) — ignored`);
-  } else if (kind === K_PING && pendingPing && msgId === pendingPing.msgId) {
-    const rtt = Date.now() - pendingPing.sentAt;
-    pendingPing = null;
-    $('ping').disabled = false;
+  } else if (kind === K_PING && pongWaiter && msgId === pongWaiter.msgId) {
+    const rtt = Date.now() - pongWaiter.sentAt;
+    const w = pongWaiter;
+    pongWaiter = null;
     $('pingResult').innerHTML =
       `<b>pong</b> rtt=${rtt} ms · from 0x${hex(src)} · SNR ${snr.toFixed(1)} dB · RSSI ${rssi} dBm`;
     status(`pong from gateway 0x${hex(src)} in ${rtt} ms (SNR ${snr.toFixed(1)} dB, RSSI ${rssi} dBm)`);
+    w.resolve({ rtt, snr, rssi, src });
   } else if (kind === K_PING) {
-    log(`ping frame msg_id=0x${hex(msgId, 4)} but no pending match — ignored`);
+    log(`ping frame msg_id=0x${hex(msgId, 4)} but no ping in flight — ignored`);
   } else {
     log(`push: kind 0x${hex(kind)} msg_id 0x${hex(msgId, 4)} — not a pong, ignored`);
   }
@@ -192,32 +194,59 @@ async function pingGateway() {
     $('pingResult').textContent = 'invalid gateway id — enter 2 hex chars or the 64-hex pubkey';
     return;
   }
-  pingMsgId = (pingMsgId + 1) || 1;          // 0x0000 reserved (§3.3)
-  const msgId = pingMsgId;
-
-  // [0x19][path_len=0][ dst ][ src ][ 0x15 ][flags=0][ msgId BE ] (§2.4)
-  const cmd = [CMD_SEND_RAW, 0x00, dst, ownHash, K_PING, 0x00,
-               (msgId >> 8) & 0xFF, msgId & 0xFF];
-  pendingPing = { msgId, sentAt: Date.now() };
+  if (busy) return;
+  busy = true;
   $('ping').disabled = true;
-  $('pingResult').innerHTML = `pinging gateway 0x${hex(dst)} (msg_id 0x${hex(msgId, 4)})…`;
   try {
-    await rxChar.writeValueWithResponse(new Uint8Array(cmd));
-    status(`ping 0x${hex(msgId, 4)} sent toward 0x${hex(dst)} — waiting for the echo…`);
-    // Timeout: the air is slow, but not THIS slow (§12.5).
-    setTimeout(() => {
-      if (pendingPing && pendingPing.msgId === msgId) {
-        pendingPing = null;
-        $('ping').disabled = false;
-        $('pingResult').textContent =
-          'no reply — is mesh-radio running on the gateway? both nodes powered? hash correct?';
-        status('ping timed out');
+    const msgId = (pingMsgId % 65535) + 1;   // 0x0000 reserved (§3.3)
+    pingMsgId = msgId;
+
+    // Raw datagrams have NO radio-layer retransmission — a lost ping is lost.
+    // So retry up to 3 times, bumping the L1 ATTEMPT counter (§2.8/§3.1) so no
+    // resend is byte-identical (MeshCore duplicate suppression would eat it).
+    const ATTEMPTS = 3, WAIT_MS = 10000;
+    for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
+      const flags = attempt << 2;                       // ATTEMPT bits 2–3
+      // [0x19][path_len=0][ dst ][ src ][ 0x15 ][flags][ msgId BE ] (§2.4)
+      const cmd = [CMD_SEND_RAW, 0x00, dst, ownHash, K_PING, flags,
+                   (msgId >> 8) & 0xFF, msgId & 0xFF];
+      $('pingResult').innerHTML =
+        `pinging gateway 0x${hex(dst)} (msg_id 0x${hex(msgId, 4)}, try ${attempt + 1}/${ATTEMPTS})…`;
+
+      const pong = new Promise(resolve => {
+        pongWaiter = { msgId, sentAt: Date.now(), resolve };
+        // per-attempt timeout
+        setTimeout(() => {
+          if (pongWaiter && pongWaiter.resolve === resolve) {
+            pongWaiter = null;
+            resolve(null);
+          }
+        }, WAIT_MS);
+      });
+
+      try {
+        await rxChar.writeValueWithResponse(new Uint8Array(cmd));
+      } catch (e) {
+        status(`BLE write failed: ${e.message}`);
+        pongWaiter = null;
+        return;
       }
-    }, 20000);
-  } catch (e) {
-    pendingPing = null;
+      status(`ping 0x${hex(msgId, 4)} try ${attempt + 1} toward 0x${hex(dst)} — waiting for echo…`);
+
+      const result = await pong;
+      if (result) return;                     // pong card already rendered
+      log(`try ${attempt + 1}: no pong within ${WAIT_MS / 1000}s`);
+      if (attempt < ATTEMPTS - 1) {
+        log('retrying with ATTEMPT+1 (never a byte-identical resend, §2.8)');
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    $('pingResult').textContent =
+      'no reply after 3 tries — check: mesh-radio running? both nodes powered & in range? node OK lines below?';
+    status('ping gave up after 3 attempts');
+  } finally {
+    busy = false;
     $('ping').disabled = false;
-    status(`BLE write failed: ${e.message}`);
   }
 }
 
@@ -234,7 +263,7 @@ async function connect() {
       filters: [{ services: [NUS_SERVICE] }]
     });
     device.addEventListener('gattserverdisconnected',
-      () => { status('disconnected'); $('ping').disabled = false; pendingPing = null; });
+      () => { status('disconnected'); pongWaiter = null; });
 
     status(`connecting to ${device.name}…`);
     const server = await device.gatt.connect();
