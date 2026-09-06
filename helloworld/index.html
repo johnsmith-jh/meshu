@@ -16,6 +16,9 @@
   .card { border: 1px solid #ddd; border-radius: 10px; padding: .8rem 1rem;
           margin: .6rem 0; word-break: break-all; font-size: .85rem; }
   .card b { display: inline-block; min-width: 6rem; }
+  input { font-size: 1rem; padding: .7rem; width: calc(100% - 1.4rem);
+          border: 2px solid #111; border-radius: 10px; font-family: ui-monospace, monospace; }
+  #pingResult { font-size: .95rem; }
   #log { background: #f6f6f6; border-radius: 10px; padding: .8rem;
          font-family: ui-monospace, monospace; font-size: .72rem; height: 14rem;
          overflow-y: auto; white-space: pre-wrap; }
@@ -23,17 +26,29 @@
 </head>
 <body>
 <h1>meshu — hello node</h1>
-<p>Connects to the MeshCore companion node over BLE, sends APP_START,
-shows SELF_INFO. No wallet, no mesh, just the pipe.</p>
+<p>Connects to the MeshCore companion node over BLE, sends APP_START, shows
+SELF_INFO — then PINGs the gateway daemon over the mesh. No wallet logic.</p>
 
 <button id="connect">Connect to node</button>
 <div id="status">idle</div>
 
 <div id="info" hidden>
   <div class="card"><b>node</b> <span id="nodeName"></span></div>
+  <div class="card"><b>my hash</b> <span id="ownHash"></span> <span style="color:#666">(first byte of the node pubkey)</span></div>
   <div class="card"><b>pubkey</b> <span id="nodeKey"></span></div>
   <div class="card"><b>radio</b> <span id="nodeRadio"></span></div>
   <div class="card"><b>tx power</b> <span id="nodeTx"></span></div>
+</div>
+
+<div id="pingBox" hidden>
+  <h2 style="font-size:1.05rem">ping gateway</h2>
+  <p style="font-size:.8rem;color:#666">Enter the gateway node's hash (2 hex,
+  e.g. <code>7f</code>) or its full 64-hex pubkey — as printed by
+  <code>mesh-radio</code> on the gateway host. One ping per tap; the running
+  gateway echoes it back over the mesh.</p>
+  <input id="gwInput" placeholder="gateway hash or full pubkey" autocomplete="off" spellcheck="false">
+  <button id="ping" style="margin-top:.6rem">Ping gateway</button>
+  <div class="card" id="pingResult"></div>
 </div>
 
 <div id="log"></div>
@@ -51,6 +66,13 @@ const TX_CHAR     = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // node -> app
 const APP_START = [0x01, 0x03, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20]
   .concat(Array.from(new TextEncoder().encode('meshu-hw')));
 
+// Companion frame types we care about.
+const T_SELF_INFO = 0x05, T_OK = 0x00, T_ERR = 0x01, T_RAW_PUSH = 0x84;
+// Raw datagram send: CMD_SEND_RAW_DATA, zero-hop (PROTOCOL.md §2.4).
+const CMD_SEND_RAW = 0x19;
+// L1 kinds (§3.1): DATA 0x10, ACKBM 0x12, NACK 0x13, ABORT 0x14, PING 0x15.
+const K_PING = 0x15;
+
 const $ = id => document.getElementById(id);
 const log = msg => {
   const t = new Date().toISOString().slice(11, 23);
@@ -58,11 +80,15 @@ const log = msg => {
   $('log').scrollTop = 1e9;
 };
 const status = s => { $('status').textContent = s; log(s); };
+const hex = (b, n = 2) => b.toString(16).padStart(n, '0');
+const signed8 = b => (b > 127 ? b - 256 : b);
 
 let device = null, rxChar = null;
+let ownHash = -1;                 // first byte of our node's pubkey (§2.2)
+let pingMsgId = 0;
+let pendingPing = null;           // { msgId, sentAt }
 
-// Notifications may arrive in chunks; accumulate and parse SELF_INFO once
-// we hold a full frame (>=58 bytes starting with 0x05).
+// Notifications may arrive in chunks; accumulate, then dispatch by frame type.
 let buf = new Uint8Array(0);
 
 function appendBuf(chunk) {
@@ -71,29 +97,134 @@ function appendBuf(chunk) {
   buf = next;
 }
 
+// ---- frame handlers ------------------------------------------------------
+
 function parseSelfInfo() {
-  if (buf.length < 58 || buf[0] !== 0x05) return false;
+  if (buf.length < 58 || buf[0] !== T_SELF_INFO) return false;
   const dv = new DataView(buf.buffer);
-  const key = Array.from(buf.slice(4, 36))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
+  const key = Array.from(buf.slice(4, 36)).map(b => hex(b)).join('');
   const freq = dv.getUint32(48, true) / 1000;
   const bw   = dv.getUint32(52, true) / 1000;
   const sf   = buf[56], cr = buf[57];
   const name = new TextDecoder().decode(buf.slice(58)).replace(/\0/g, '').trim();
 
+  ownHash = buf[4]; // gateway_hash = pubkey[0] convention, mirrored for us (§2.2)
+
   $('nodeName').textContent = name || '(unnamed)';
   $('nodeKey').textContent  = key;
+  $('ownHash').textContent  = '0x' + hex(ownHash);
   $('nodeRadio').textContent = `${freq} MHz / BW ${bw} kHz / SF${sf} / CR4/${cr + 4}`;
   $('nodeTx').textContent    = `${buf[2]} (max ${buf[3]})`;
   $('info').hidden = false;
-  status(`got SELF_INFO from "${name}"`);
+  $('pingBox').hidden = false;
+  status(`got SELF_INFO from "${name}" — my hash 0x${hex(ownHash)}`);
   buf = new Uint8Array(0);
   return true;
 }
 
+function parseRawPush() {
+  // §2.5: [0x84][SNR s8 ×4][RSSI s8][0xFF][ dst ][ src ][ L1 frame ]
+  if (buf.length < 4 + 2 + 4) return false;
+  const snr  = signed8(buf[1]) / 4;
+  const rssi = signed8(buf[2]);
+  const dst = buf[4], src = buf[5];
+  const kind = buf[6] & 0x3F, flags = buf[7];
+  const msgId = (buf[8] << 8) | buf[9];
+
+  if (dst !== ownHash) {
+    log(`push for hash 0x${hex(dst)} (not us) — ignored`);
+  } else if (kind === K_PING && pendingPing && msgId === pendingPing.msgId) {
+    const rtt = Date.now() - pendingPing.sentAt;
+    pendingPing = null;
+    $('ping').disabled = false;
+    $('pingResult').innerHTML =
+      `<b>pong</b> rtt=${rtt} ms · from 0x${hex(src)} · SNR ${snr.toFixed(1)} dB · RSSI ${rssi} dBm`;
+    status(`pong from gateway 0x${hex(src)} in ${rtt} ms (SNR ${snr.toFixed(1)} dB, RSSI ${rssi} dBm)`);
+  } else if (kind === K_PING) {
+    log(`ping frame msg_id=0x${hex(msgId, 4)} but no pending match — ignored`);
+  } else {
+    log(`push: kind 0x${hex(kind)} msg_id 0x${hex(msgId, 4)} — not a pong, ignored`);
+  }
+  buf = new Uint8Array(0);
+  return true;
+}
+
+function handleFrame() {
+  if (buf.length === 0) return;
+  switch (buf[0]) {
+    case T_SELF_INFO: parseSelfInfo(); break;
+    case T_RAW_PUSH:  if (!parseRawPush()) return; /* wait for more */ break;
+    case T_OK:
+      log('node: OK — datagram queued for the air');
+      buf = new Uint8Array(0);
+      break;
+    case T_ERR: {
+      const err = buf.length > 1 ? buf[1] : -1;
+      if (err === 3) {
+        log('node: queue FULL (§2.8) — wait a moment and tap again');
+        if (pendingPing) { pendingPing = null; $('ping').disabled = false; }
+      } else {
+        log(`node: ERR code ${err}`);
+      }
+      buf = new Uint8Array(0);
+      break;
+    }
+    default:
+      log(`frame type 0x${hex(buf[0])} — ignored`);
+      buf = new Uint8Array(0);
+  }
+}
+
+// ---- gateway ping ---------------------------------------------------------
+
+function parseGatewayHash() {
+  const raw = $('gwInput').value.replace(/[\s:.-]/g, '').toLowerCase();
+  if (!/^[0-9a-f]+$/.test(raw)) return null;
+  if (raw.length === 2) return parseInt(raw, 16);
+  if (raw.length === 64) return parseInt(raw.slice(0, 2), 16); // pubkey[0] (§2.2)
+  return null;
+}
+
+async function pingGateway() {
+  const dst = parseGatewayHash();
+  if (dst === null || dst < 0 || dst > 255) {
+    $('pingResult').textContent = 'invalid gateway id — enter 2 hex chars or the 64-hex pubkey';
+    return;
+  }
+  pingMsgId = (pingMsgId + 1) || 1;          // 0x0000 reserved (§3.3)
+  const msgId = pingMsgId;
+
+  // [0x19][path_len=0][ dst ][ src ][ 0x15 ][flags=0][ msgId BE ] (§2.4)
+  const cmd = [CMD_SEND_RAW, 0x00, dst, ownHash, K_PING, 0x00,
+               (msgId >> 8) & 0xFF, msgId & 0xFF];
+  pendingPing = { msgId, sentAt: Date.now() };
+  $('ping').disabled = true;
+  $('pingResult').innerHTML = `pinging gateway 0x${hex(dst)} (msg_id 0x${hex(msgId, 4)})…`;
+  try {
+    await rxChar.writeValueWithResponse(new Uint8Array(cmd));
+    status(`ping 0x${hex(msgId, 4)} sent toward 0x${hex(dst)} — waiting for the echo…`);
+    // Timeout: the air is slow, but not THIS slow (§12.5).
+    setTimeout(() => {
+      if (pendingPing && pendingPing.msgId === msgId) {
+        pendingPing = null;
+        $('ping').disabled = false;
+        $('pingResult').textContent =
+          'no reply — is mesh-radio running on the gateway? both nodes powered? hash correct?';
+        status('ping timed out');
+      }
+    }, 20000);
+  } catch (e) {
+    pendingPing = null;
+    $('ping').disabled = false;
+    status(`BLE write failed: ${e.message}`);
+  }
+}
+
+// ---- connect ---------------------------------------------------------------
+
 async function connect() {
   if (!navigator.bluetooth) {
-    status('Web Bluetooth unavailable — need a SECURE context (see notes) and Android Chrome');
+    status('Web Bluetooth unavailable — need a SECURE context (https) and Android Chrome');
     return;
   }
   try {
@@ -102,7 +233,7 @@ async function connect() {
       filters: [{ services: [NUS_SERVICE] }]
     });
     device.addEventListener('gattserverdisconnected',
-      () => status('disconnected'));
+      () => { status('disconnected'); $('ping').disabled = false; pendingPing = null; });
 
     status(`connecting to ${device.name}…`);
     const server = await device.gatt.connect();
@@ -113,7 +244,7 @@ async function connect() {
     await txChar.startNotifications();
     txChar.addEventListener('characteristicvaluechanged', ev => {
       appendBuf(new Uint8Array(ev.target.value.buffer));
-      parseSelfInfo();
+      handleFrame();
     });
 
     status('connected — sending APP_START…');
@@ -125,6 +256,7 @@ async function connect() {
 }
 
 $('connect').addEventListener('click', connect);
+$('ping').addEventListener('click', pingGateway);
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
