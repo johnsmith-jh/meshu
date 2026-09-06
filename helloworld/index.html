@@ -25,7 +25,7 @@
 </style>
 </head>
 <body>
-<h1>meshu — hello node</h1>
+<h1>meshu — hello node <small id="verTag" style="color:#666;font-weight:400"></small></h1>
 <p>Connects to the MeshCore companion node over BLE, sends APP_START, shows
 SELF_INFO — then PINGs the gateway daemon over the mesh. No wallet logic.</p>
 
@@ -55,6 +55,9 @@ SELF_INFO — then PINGs the gateway daemon over the mesh. No wallet logic.</p>
 
 <script>
 'use strict';
+
+// Bump on every deploy so the phone can be checked against the live page.
+const VERSION = 'v9 — time-seeded msg_id';
 
 // MeshCore companion over BLE GATT (Nordic UART service).
 const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -87,8 +90,13 @@ let device = null, rxChar = null;
 let ownHash = -1;                 // first byte of our node's pubkey (§2.2)
 // §2.8/§3.3: NEVER reuse a msg_id with identical bytes — MeshCore's node-level
 // duplicate-suppression (160-slot seen table, survives page reloads!) silently
-// eats verbatim resends. Persist the counter across reloads.
+// eats verbatim resends. Persist the counter, and on first run seed it from the
+// clock: msg_id 0x0001 with ATTEMPT 0..2 is poisoned by earlier sessions.
 let pingMsgId = parseInt(localStorage.getItem('meshu-hw-ping-id') || '0', 10) || 0;
+if (!pingMsgId) {
+  pingMsgId = Math.floor((Date.now() / 1000) % 65000) + 500;
+  localStorage.setItem('meshu-hw-ping-id', String(pingMsgId));
+}
 let pongWaiter = null;            // resolves when the matching pong arrives
 let busy = false;                 // one ping sequence at a time
 
@@ -368,6 +376,9 @@ async function connect() {
     status(`error: ${e.message}`);
   }
 }
+
+$('verTag').textContent = VERSION;
+log(`meshu helloworld ${VERSION}`);
 
 $('connect').addEventListener('click', connect);
 $('ping').addEventListener('click', pingGateway);
