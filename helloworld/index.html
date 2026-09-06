@@ -163,32 +163,49 @@ function parseRawPush() {
   return true;
 }
 
-// 0x88 RF log: [0x88][SNR s8 ×4][RSSI s8][ raw air packet ] — the node pushes
-// one for EVERY packet its radio hears, BEFORE delivery. Decoding it shows what
-// actually reaches the node (and it frequently shares a BLE notification with
-// the 0x84 that follows it — so consume exactly, never blanket-clear).
-function parseLogRx() {
-  if (buf.length < 3) return false;            // wait for more bytes
-  const snr  = signed8(buf[1]) / 4;
-  const rssi = signed8(buf[2]);
-  let i = 3;                                    // start of raw air packet
-  if (buf.length < i + 2) return false;
-  const hdr = buf[i++];
-  if ((hdr >> 6) !== 0) i += 4;                 // transport codes (version != 0)
-  if (buf.length < i + 1) return false;
-  const pathLen = buf[i++];                     // encoded: count | mode<<6
-  const pathBytes = (pathLen & 63) * ((pathLen >> 6) + 1);
-  if (buf.length < i + pathBytes + 1) return false;
-  i += pathBytes;
-  const payloadLen = buf[i++];
-  if (buf.length < i + payloadLen) return false;
-  const total = i + payloadLen;
-  const type = (hdr >> 2) & 0xF;
-  const airHex = Array.from(buf.slice(2, total)).map(b => hex(b)).join('');
-  log(`RF rx: type=0x${hex(type)} snr=${snr.toFixed(1)}dB rssi=${rssi}dBm [${airHex}]`);
-  buf = buf.slice(total);
+// 0x88 RF log: [0x88][SNR s8 ×4][RSSI s8][ raw air packet ]. The node pushes one
+// for EVERY packet its radio hears, BEFORE delivery — and frequently shares a
+// BLE notification with the 0x84 that follows. Air packets carry no payload
+// length (payload = remainder), so exact consumption is impossible; instead we
+// scan for unambiguous pong signatures anywhere in the buffer.
+function findPongSignature() {
+  for (let p = 0; p + 10 <= buf.length; p++) {
+    if (buf[p] !== T_RAW_PUSH) continue;         // 0x84
+    if (buf[p + 3] !== 0xFF) continue;           // reserved byte
+    if (buf[p + 4] !== ownHash) continue;        // addressed to us
+    if ((buf[p + 6] & 0x3F) !== K_PING) continue; // L1 kind PING
+    if (buf[p + 7] & ~0x0C) continue;            // only ATTEMPT bits may be set
+    if (buf[p + 8] === 0 && buf[p + 9] === 0) continue; // msg_id 0x0000 reserved
+    return p;
+  }
+  return -1;
+}
+
+function extractPong() {
+  const p = findPongSignature();
+  if (p < 0) return false;
+  const frame = buf.slice(p, p + 10);
+  buf = buf.slice(p + 10);
+  const snr  = signed8(frame[1]) / 4;
+  const rssi = signed8(frame[2]);
+  const src  = frame[5];
+  const msgId = (frame[8] << 8) | frame[9];
+  if (pongWaiter && msgId === pongWaiter.msgId) {
+    const rtt = Date.now() - pongWaiter.sentAt;
+    const w = pongWaiter;
+    pongWaiter = null;
+    $('pingResult').innerHTML =
+      `<b>pong</b> rtt=${rtt} ms · from 0x${hex(src)} · SNR ${snr.toFixed(1)} dB · RSSI ${rssi} dBm`;
+    status(`pong from gateway 0x${hex(src)} in ${rtt} ms (SNR ${snr.toFixed(1)} dB, RSSI ${rssi} dBm)`);
+    w.resolve({ rtt, snr, rssi, src });
+  } else {
+    log(`ping frame msg_id=0x${hex(msgId, 4)} but no ping in flight — ignored`);
+  }
   return true;
 }
+
+const hexDump = (from, to) =>
+  Array.from(buf.slice(from, to)).map(b => hex(b)).join('');
 
 // One BLE notification may carry MULTIPLE concatenated companion frames (the
 // node pushes its 0x88 RF-log immediately before the 0x84 raw-data push for the
@@ -196,23 +213,36 @@ function parseLogRx() {
 // buffer blindly — that would destroy whatever follows the frame in hand.
 function handleFrames() {
   let guard = 0;
-  while (buf.length > 0 && guard++ < 32) {
+  while (buf.length > 0 && guard++ < 64) {
+    // A pong may hide behind (or inside) anything — scan first, every iteration.
+    if (extractPong()) continue;
     switch (buf[0]) {
       case T_SELF_INFO:
         if (!parseSelfInfo()) return;          // incomplete — wait
         break;
       case T_RAW_PUSH:
-        if (!parseRawPush()) return;           // incomplete — wait
+        if (!parseRawPush()) return;            // incomplete — wait
         break;
-      case T_LOG_RX:
-        if (!parseLogRx()) return;             // incomplete — wait
+      case T_LOG_RX: {
+        // Best-effort RF log: type + link quality of every packet the node hears.
+        const snr  = signed8(buf[1]) / 4;
+        const rssi = signed8(buf[2]);
+        const type = (buf[3] >> 2) & 0xF;
+        const p = findPongSignature();
+        if (p > 0) {
+          log(`RF rx: type=0x${hex(type)} snr=${snr.toFixed(1)}dB rssi=${rssi}dBm [${hexDump(3, p)}]`);
+          break;                                // pong extracted next iteration
+        }
+        log(`RF rx: type=0x${hex(type)} snr=${snr.toFixed(1)}dB rssi=${rssi}dBm [${hexDump(3, buf.length)}]`);
+        buf = new Uint8Array(0);                // air packets are remainder-terminated
         break;
+      }
       case T_OK:
         log('node: OK — datagram queued for the air');
-        buf = buf.slice(1);                    // RESP_CODE_OK is exactly 1 byte
+        buf = buf.slice(1);                      // RESP_CODE_OK is exactly 1 byte
         break;
       case T_ERR:
-        if (buf.length < 2) return;             // incomplete — wait
+        if (buf.length < 2) return;              // incomplete — wait
         if (buf[1] === 3) {
           log('node: queue FULL (§2.8) — the node is backed up, datagram was refused');
         } else {
