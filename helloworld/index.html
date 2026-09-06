@@ -85,7 +85,10 @@ const signed8 = b => (b > 127 ? b - 256 : b);
 
 let device = null, rxChar = null;
 let ownHash = -1;                 // first byte of our node's pubkey (§2.2)
-let pingMsgId = 0;
+// §2.8/§3.3: NEVER reuse a msg_id with identical bytes — MeshCore's node-level
+// duplicate-suppression (160-slot seen table, survives page reloads!) silently
+// eats verbatim resends. Persist the counter across reloads.
+let pingMsgId = parseInt(localStorage.getItem('meshu-hw-ping-id') || '0', 10) || 0;
 let pongWaiter = null;            // resolves when the matching pong arrives
 let busy = false;                 // one ping sequence at a time
 
@@ -280,6 +283,7 @@ async function pingGateway() {
   try {
     const msgId = (pingMsgId % 65535) + 1;   // 0x0000 reserved (§3.3)
     pingMsgId = msgId;
+    localStorage.setItem('meshu-hw-ping-id', String(pingMsgId));
 
     // Raw datagrams have NO radio-layer retransmission — a lost ping is lost.
     // So retry up to 3 times, bumping the L1 ATTEMPT counter (§2.8/§3.1) so no
