@@ -1,0 +1,24 @@
+spring:
+  application:
+    name: meshu-gateway
+  datasource:
+    url: jdbc:sqlite:./meshu-gateway.db
+  sql:
+    init:
+      mode: always
+
+# HTTPS transport (POC-WALLET.md §9). In production the daemon MUST sit behind a
+# CA-signed certificate on a real domain (Caddy/nginx/Let's Encrypt) with CORS
+# for the wallet's origin (§9.3) — there is no insecure-HTTP fallback for the
+# browser wallet. For local dev, plain HTTP on localhost is fine.
+server:
+  port: 8080
+
+meshu:
+  serial:
+    # empty = auto-detect a single usbmodem/usbserial device
+    port: ""
+    baud: 115200
+  mint:
+    # PoC: remote mint over HTTPS. A local mint (Nutshell/CDK) comes later.
+    url: https://mint.minibits.cash/Bitcoin
