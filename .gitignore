@@ -11,21 +11,12 @@
 .project
 .classpath
 .settings/
+target/
 
 # Node (wallet PWA)
 node_modules/
 dist/
 *.log
-
-# Python (gateway daemon)
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-
-# Rust (potential components)
-target/
 
 # Env / secrets
 .env
@@ -39,9 +30,4 @@ target/
 *.db-wal
 *.db-shm
 
-# Spec drafts and design notes are NOT published to the repo
-*.md
-!README.md
-!PROTOCOL.md
-!wallet-pwa/README.md
 docs/
