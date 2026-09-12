@@ -7,8 +7,8 @@
  * RF-log (0x88) visibility — MESHCORE-RADIO.md §3/§8.
  *
  * Companion frames over BLE have NO length prefix, so lengths are derived per
- * type; remainder-terminated types (0x88, SELF_INFO) are handled by scanning
- * for unambiguous signatures rather than exact consumption.
+ * type; remainder-terminated types (0x84, 0x88, SELF_INFO) are handled by
+ * scanning for unambiguous signatures rather than exact consumption.
  */
 
 export const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -29,6 +29,8 @@ export function appStart(name: string): Uint8Array {
 export const F_OK = 0x00;
 export const F_ERR = 0x01;
 export const F_SELF_INFO = 0x05;
+/** CMD_SEND_RAW_DATA (§2.4): [0x19][path_len][path][payload ≤174]. */
+export const CMD_SEND_RAW = 0x19;
 export const F_RAW_PUSH = 0x84;
 export const F_LOG_RX = 0x88;
 
@@ -50,8 +52,9 @@ const signed8 = (b: number): number => (b > 127 ? b - 256 : b);
 
 /**
  * Incremental notification parser. Handles coalesced frames by per-type
- * consumption where lengths are derivable; remainder-terminated types are
- * consumed by signature-scan (see MESHCORE-RADIO.md §3/§8).
+ * consumption where lengths are derivable; remainder-terminated types (raw
+ * pushes, RF logs, SELF_INFO) are consumed by signature-scan (see
+ * MESHCORE-RADIO.md §3/§8).
  */
 export class CompanionParser {
   private buf = new Uint8Array(0);
@@ -80,16 +83,22 @@ export class CompanionParser {
       }
       if (t === F_RAW_PUSH) {
         if (this.buf.length < 10) break; // min: 4 prefix + dst + src + L1 header
-        // PING-shaped raw pushes are exactly 10 B; longer ones carry L2/DATA
-        // bodies with no self-describing length — out of helloworld scope and
-        // out of Phase-0 scope. The payload is capped at the 10-byte
-        // consumption so the two never disagree (review fix); anything beyond
-        // is parsed as the next frame. Phase 1 must give raw pushes the same
-        // anchor-scan treatment as 0x88 — they are remainder-terminated (§2.5).
+        // Raw pushes are remainder-terminated (§2.5 — no length byte), so under
+        // coalescing the payload runs to the next UNAMBIGUOUS frame start
+        // (0x84 with 0xFF at +3 — the v9 anchor) or to the end of the buffer.
+        // 0x00/0x01/0x05 are NOT safe anchors: a sealed L2 body begins with
+        // epoch 0x00, so a trailing OK absorbed into the payload is the
+        // accepted loss (a log line), never the other way round. Assumes the
+        // negotiated ATT MTU carries a whole companion frame per notification
+        // (Android Chrome negotiates ≥185; the helloworld's coalesced frames
+        // prove it) — a smaller MTU would split pushes across notifications
+        // with no delimiter to detect it.
         const snr = signed8(this.buf[1]!) / 4;
         const rssi = signed8(this.buf[2]!);
-        out.push({ kind: 'raw', payload: this.buf.slice(4, 10), snr, rssi });
-        this.buf = this.buf.slice(10);
+        const next = this.findEmbeddedFrameStart(4);
+        const end = next < 0 ? this.buf.length : next;
+        out.push({ kind: 'raw', payload: this.buf.slice(4, end), snr, rssi });
+        this.buf = this.buf.slice(end);
         continue;
       }
       if (t === F_LOG_RX) {
@@ -174,12 +183,14 @@ export function parseSelfInfo(payload: Uint8Array): SelfInfo {
   };
 }
 
-/** Full BLE link: connect, exchange, and subscribe. Phase-0 scope: no L1 yet. */
+/** Full BLE link: connect, exchange, and subscribe. */
 export class BleLink {
   private rxChar: BluetoothRemoteGATTCharacteristic | null = null;
   private device: BluetoothDevice | null = null;
   private parser = new CompanionParser();
   private pushHandler: ((push: InboundPush) => void) | null = null;
+  /** Node identity from the last APP_START (null before connect). */
+  selfInfo: SelfInfo | null = null;
 
   static available(): boolean {
     return typeof navigator !== 'undefined' && !!navigator.bluetooth;
@@ -203,14 +214,16 @@ export class BleLink {
     const txChar = await svc.getCharacteristic(NUS_TX);
     await txChar.startNotifications();
     txChar.addEventListener('characteristicvaluechanged', ev => {
-      const chunk = new Uint8Array((ev.target as BluetoothRemoteGATTCharacteristic).value!.buffer);
+      const target = ev.target as BluetoothRemoteGATTCharacteristic;
+      const chunk = new Uint8Array(target.value!.buffer);
       for (const push of this.parser.feed(chunk)) {
         this.pushHandler?.(push);
       }
     });
 
     await this.write(appStart(appName));
-    return await this.awaitSelfInfo(5000);
+    this.selfInfo = await this.awaitSelfInfo(5000);
+    return this.selfInfo;
   }
 
   onPush(handler: (push: InboundPush) => void): void {

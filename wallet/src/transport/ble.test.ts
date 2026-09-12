@@ -67,8 +67,70 @@ describe('BLE companion transport (port of helloworld v9 lessons)', () => {
 
     const p = new CompanionParser();
     const pushes = p.feed(merged);
-    expect(pushes.map(x => x.kind)).toEqual(['raw', 'ok']);
-    expect(pushes[0]!.payload!.length).toBe(6); // dst ‖ src ‖ 4-byte L1 header, nothing more
+    // Remainder-terminated contract (Phase 1): 0x00 is NOT a safe anchor — a
+    // sealed L2 body starts with epoch 0x00 — so the trailing OK is absorbed
+    // into the payload (a lost log line), never the reverse.
+    expect(pushes.map(x => x.kind)).toEqual(['raw']);
+    expect(pushes[0]!.payload!.length).toBe(7); // 6-byte pong payload + absorbed OK
+  });
+
+  test('long raw push delivered WHOLE (Phase-1 remainder-terminated parse)', () => {
+    // A real HELLO response push: ~110 B, not 10. Regression guard for the
+    // Phase-0 10-byte cap that destroyed every real inbound frame.
+    const payload = new Uint8Array(102);
+    payload.set([0xeb, 0xc7, 0x10, 0x02, 0x12, 0x34], 0); // dst ‖ src ‖ L1 hdr
+    for (let i = 6; i < payload.length; i++) payload[i] = i & 0xff;
+    const push = new Uint8Array(4 + payload.length);
+    push.set([F_RAW_PUSH, 0x0a, 0xa0, 0xff], 0);
+    push.set(payload, 4);
+
+    const pushes = new CompanionParser().feed(push);
+    expect(pushes.length).toBe(1);
+    expect(pushes[0]!.kind).toBe('raw');
+    expect(pushes[0]!.payload!.length).toBe(102);
+    expect(Array.from(pushes[0]!.payload!.slice(0, 6))).toEqual([0xeb, 0xc7, 0x10, 0x02, 0x12, 0x34]);
+  });
+
+  test('two coalesced pushes split at the 0x84+0xFF anchor', () => {
+    const pushPayload = (dst: number, len: number, seed: number): Uint8Array => {
+      const p = new Uint8Array(len);
+      p.set([dst, 0xc7, 0x10, 0x02, 0x12, 0x34], 0);
+      for (let i = 6; i < len; i++) p[i] = (seed + i) & 0xff;
+      return p;
+    };
+    const p1 = pushPayload(0xeb, 20, 1);
+    const p2 = pushPayload(0xeb, 102, 7);
+    const frame = (p: Uint8Array) => {
+      const f = new Uint8Array(4 + p.length);
+      f.set([F_RAW_PUSH, 0x0a, 0xa0, 0xff], 0);
+      f.set(p, 4);
+      return f;
+    };
+    const merged = new Uint8Array(frame(p1).length + frame(p2).length);
+    merged.set(frame(p1));
+    merged.set(frame(p2), frame(p1).length);
+
+    const pushes = new CompanionParser().feed(merged);
+    expect(pushes.map(x => x.kind)).toEqual(['raw', 'raw']);
+    expect(pushes[0]!.payload!.length).toBe(20);
+    expect(pushes[1]!.payload!.length).toBe(102);
+    expect(Array.from(pushes[1]!.payload!.slice(0, 6))).toEqual([0xeb, 0xc7, 0x10, 0x02, 0x12, 0x34]);
+  });
+
+  test('coalesced rflog + LONG push both survive', () => {
+    const rflog = new Uint8Array([F_LOG_RX, 0x0a, 0xa0, 0x3c, 0x00, 0x06, 0xc7, 0xeb, 0x15, 0x00, 0x00, 0x07]);
+    const payload = new Uint8Array(102);
+    payload.set([0xeb, 0xc7, 0x10, 0x02, 0x12, 0x34], 0);
+    const push = new Uint8Array(4 + payload.length);
+    push.set([F_RAW_PUSH, 0x0a, 0xa0, 0xff], 0);
+    push.set(payload, 4);
+    const merged = new Uint8Array(rflog.length + push.length);
+    merged.set(rflog);
+    merged.set(push, rflog.length);
+
+    const pushes = new CompanionParser().feed(merged);
+    expect(pushes.map(x => x.kind)).toEqual(['rflog', 'raw']);
+    expect(pushes[1]!.payload!.length).toBe(102);
   });
 
   test('SELF_INFO parses all fields (name, pubkey, radio)', () => {
