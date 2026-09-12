@@ -12,6 +12,7 @@
 .classpath
 .settings/
 target/
+*.class
 
 # Node (wallet PWA)
 node_modules/
